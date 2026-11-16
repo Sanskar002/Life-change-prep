@@ -229,3 +229,187 @@ For the query `"BMS 0x84F2 thermal limit"`, compare three candidate chunks:
    * **Dense Path:** Search the in-RAM Binary HNSW graph via `XOR + POPCOUNT` with $4\times$ oversampling (fetching 200 candidates in ~4 ms), then rescore those 200 vectors from SSD `mmap` in FP16 (~3 ms) to produce the Top 50 Dense hits.
    * **Lexical Path:** Run BM25 ($k_1=1.2, b=0.4$) in parallel to fetch the Top 50 Lexical hits (~5 ms).
    * **Fusion:** Merge both Top-50 lists via **RRF ($k=60$)** in <1 ms and pass the top 20 candidates to the downstream reranker.
+
+
+# Day 3 Addendum: SIMD Hardware Acceleration & Google TurboQuant
+
+**Scope:** CPU Vector Register Parallelism (SIMD) & Data-Oblivious Online Vector Quantization (TurboQuant)  
+**Prerequisites:** None — explained from first principles with everyday analogies and toy numeric examples.  
+**Purpose:** Attach this sheet to your Day 3 printout.
+
+---
+
+## Addendum Part 1: SIMD (Single Instruction, Multiple Data) — How CPUs Score Vectors Fast
+
+In your Day 3 notes, you saw that comparing vectors or running a flat scan over 2,000 filtered vectors takes less than **1 millisecond**. How can a regular CPU multiply and add millions of numbers that fast without a GPU? The secret is **SIMD**.
+
+### 1.1 The Everyday Analogy: Single-Stamp vs. Multi-Stamp Press
+Imagine you work in a post office and need to stamp **16 envelopes**:
+* **Normal CPU Execution (SISD — Single Instruction, Single Data):** You hold **1 stamp** in your hand. You stamp Envelope 1, lift your hand, move to Envelope 2, stamp it, and repeat **16 separate times**.
+* **SIMD Execution (Single Instruction, Multiple Data):** You attach **16 stamps onto one long wooden bar**. You press the bar down **once**, and all 16 envelopes get stamped in a **single motion**!
+
+```text
+Standard Loop (SISD - 1 pair at a time, 4 CPU cycles):
+Cycle 1: a[0] * b[0]
+Cycle 2: a[1] * b[1]
+Cycle 3: a[2] * b[2]
+Cycle 4: a[3] * b[3]
+
+SIMD Register (1 instruction, 1 CPU cycle for all 4 pairs at once!):
+         ┌──────┬──────┬──────┬──────┐
+Reg A:   │ a[0] │ a[1] │ a[2] │ a[3] │
+         └───┬──┴───┬──┴───┬──┴───┬──┘
+             ✕      ✕      ✕      ✕     <-- Single CPU Instruction (vfmadd)
+         ┌───┴──┬───┴──┬───┴──┬───┴──┐
+Reg B:   │ b[0] │ b[1] │ b[2] │ b[3] │
+         └──────┴──────┴──────┴──────┘
+```
+
+---
+
+### 1.2 How SIMD Lanes Work Inside the CPU (Step-by-Step Register Math)
+Modern CPUs (Intel/AMD x86 and ARM) contain extra-wide hardware storage slots called **Vector Registers**:
+* **AVX-2:** Holds **256 bits** (32 Bytes) at once.
+* **AVX-512:** Holds **512 bits** (64 Bytes) at once.
+* **ARM NEON / SVE:** Used on mobile chips and cloud ARM servers (like AWS Graviton).
+
+Look at how many vector numbers fit inside **one 512-bit (64-Byte) AVX-512 register** at the same time, depending on how we quantized the vector in Day 3:
+
+| Vector Format | Size of 1 Number | How Many Numbers Fit in One 512-Bit Register? | Speedup Per CPU Cycle |
+| :--- | :--- | :--- | :--- |
+| **FP32 (Decimal)** | 32 bits (4 Bytes) | $\frac{512}{32} = \mathbf{16\text{ numbers at once}}$ | **$16\times$ faster** than a normal loop |
+| **FP16 (Half Decimal)** | 16 bits (2 Bytes) | $\frac{512}{16} = \mathbf{32\text{ numbers at once}}$ | **$32\times$ faster** |
+| **INT8 (Scalar Quantized)** | 8 bits (1 Byte) | $\frac{512}{8} = \mathbf{64\text{ numbers at once}}$ | **$64\times$ faster** (`VNNI` instruction) |
+| **1-Bit (Binary Quantized)** | 1 bit | $\frac{512}{1} = \mathbf{512\text{ numbers at once!}}$ | **$512\times$ faster** (`XOR + POPCOUNT`) |
+
+#### Concrete Example: Scoring a 768-Dimension Vector with AVX-512
+Suppose we want to compute the dot product (similarity) between a query vector $q$ and a database vector $x$, each having **768 numbers**:
+1. **Without SIMD (Standard Python/C Loop):** The CPU executes $768$ separate multiply-and-add steps = **768 cycles**.
+2. **With AVX-512 in FP32:** The CPU packs 16 numbers into a register at a time using Fused Multiply-Add (`FMA`, which computes $\text{sum} = \text{sum} + A \times B$ in 1 step). It finishes all 768 numbers in $\frac{768}{16} = \mathbf{48\text{ steps}}$!
+3. **With AVX-512 in INT8 (SQ8):** The CPU packs 64 integers at a time, finishing all 768 numbers in $\frac{768}{64} = \mathbf{12\text{ steps}}$!
+4. **With AVX-512 in 1-Bit Binary (BQ):** The CPU compares 512 bits in step 1, and the remaining 256 bits in step 2 = **just 2 steps total**!
+
+> **Key Takeaway:** Quantization (SQ8 and Binary) does **not** just save RAM—it physically allows **more numbers to pack side-by-side into a single SIMD CPU register**, multiplying CPU speed at the exact same time!
+
+---
+
+## Addendum Part 2: Google TurboQuant — Zero-Training Quantization (Vector Search + KV Cache)
+
+### 2.1 Why Was TurboQuant Invented? (The Flaw in Product Quantization)
+In your Day 3 printout, you learned about **Product Quantization (PQ)** (the "Paint-Shop Swatch Book" that compresses vectors using 256 pre-learned k-means patterns). While PQ shrinks memory, it has **three major headaches**:
+1. **Slow Training Needed:** Before you can use PQ, you must run k-means clustering on millions of vectors to build the codebook ("Swatch Book").
+2. **Concept Drift (Stale Codebooks):** If you upload new documents on a new topic six months later, the old codebook doesn't recognize the new vector patterns, and search accuracy drops until you retrain the whole database.
+3. **Cannot Compress Streaming Data (like LLM KV Caches):** When an LLM generates tokens live during a chat, it creates brand-new **Key (K) and Value (V) vectors** every millisecond. You cannot pause a live chat for 10 minutes to run k-means clustering!
+
+**Google's TurboQuant (ICLR 2026)** solves all three problems. It is **Data-Oblivious (Zero Training Required)**—meaning it compresses any vector on the fly (down to **3 bits or 4 bits per number**, a **$6\times$ to $10\times$ reduction**) with **zero k-means codebooks**, **zero calibration data**, and **near-zero accuracy loss**.
+
+---
+
+### 2.2 The Problem with Raw Vectors: "Spiky Outlier Numbers"
+Why can't we just round every number in a vector down to 3 bits (8 possible buckets: `-4` to `+3`) directly?
+* **The Outlier Problem:** Real-world embedding vectors and LLM KV-cache vectors are **spiky**. Out of 768 numbers, 765 numbers might be tiny decimals between `-0.05` and `+0.05`, while **3 numbers are massive spikes** like `+18.5`!
+* **What goes wrong:** If you stretch your 8 tiny quantization buckets from `-18.5` to `+18.5` just to fit those 3 big spikes, all 765 of the small numbers get squashed into the `0` bucket, destroying all the information in the vector!
+
+```text
+BEFORE ROTATION (Spiky Vector — Hard to Quantize):
+Dim 1: ████████████████████████ (+18.5) <-- Giant Spike stretches the scale!
+Dim 2: ▏ (+0.02)                        <-- Gets squashed to 0!
+Dim 3: ▏ (-0.04)                        <-- Gets squashed to 0!
+Dim 4: ▏ (+0.01)                        <-- Gets squashed to 0!
+
+AFTER RANDOM ROTATION (Smooth Vector — Easy to Quantize!):
+Dim 1: ██████ (+0.92)  <-- Energy is spread evenly across all dimensions!
+Dim 2: █████  (-0.85)
+Dim 3: ██████ (+0.98)
+Dim 4: █████  (+0.88)
+```
+
+---
+
+### 2.3 How TurboQuant Works: The 3-Step Pipeline (Explained Simply)
+
+TurboQuant fixes the spiky vector problem and eliminates rounding bias using three clever mathematical steps:
+
+#### Step 1: The Random Rotation Trick ("Blending the Spikes")
+Before quantizing vector $x$, TurboQuant multiplies it by a fixed **Random Rotation Matrix** $R$ (specifically a fast **Hadamard transform** that runs in microseconds on CPU SIMD or GPU):
+$$z = R \cdot x$$
+* **Why does rotating a vector work?**
+  1. **It Preserves Exact Angles & Distances:** Think of two arrows pointing at a $30^\circ$ angle on a table. If you rotate the entire table by $45^\circ$, the angle between the two arrows is **still $30^\circ$**! Rotating all queries and documents by the same matrix $R$ changes **nothing** about their cosine similarity or dot product.
+  2. **It Smooths Out All Spikes:** Rotating the vector mixes that giant `+18.5` spike evenly across all 768 dimensions. Mathematically, after random rotation, **every single dimension follows the exact same smooth, predictable bell-like curve** with no surprise outliers!
+  3. **Zero Training Needed:** Because *any* vector rotated randomly ends up with this exact same predictable shape, Google pre-calculated the mathematically optimal quantization buckets **once forever**. You never need to train a codebook on your data!
+
+#### Step 2: PolarQuant — Converting $(X, Y)$ Grid Numbers into $(r, \theta)$ Compass Angles
+Once the vector is rotated, TurboQuant compresses the numbers using **PolarQuant**:
+* **Everyday Analogy:** On a flat map, you can describe a location using **Cartesian coordinates** $(X = 3\text{ km East}, \; Y = 4\text{ km North})$, OR using **Polar coordinates** $(\text{Distance Radius } r = 5\text{ km}, \; \text{Compass Angle } \theta = 53^\circ)$.
+* **Why Polar Coordinates Save Memory:**  
+  In traditional quantization, every small block of numbers needs to store extra "scaling factor" metadata (min/max boundaries) to remember how big the numbers were, which wastes memory.  
+  **PolarQuant** pairs up coordinates recursively into angles and radii until the entire vector is represented by **one single radius number** and a list of **compass angles** (which are always strictly bounded between $0^\circ$ and $360^\circ$).
+  * Because angles never exceed $360^\circ$, **zero per-block scaling metadata is needed**, and spending just **2 to 3 bits per number** captures almost the entire shape of the vector!
+
+#### Step 3: QJL (1-Bit Error Checker) — Fixing the Rounding Bias
+When you round numbers to 2 or 3 bits in Step 2, there is always a tiny leftover rounding error (called the **residual**):
+$$\text{Error } e = \text{Original Vector } x - \text{PolarQuant Vector } \hat{x}$$
+If you ignore this tiny error $e$, when calculating millions of dot products (either in Vector Search or in LLM Attention), those tiny rounding errors add up and create a **systematic bias** (making scores slightly higher or lower than they should be).
+
+* **How TurboQuant fixes it with just 1 extra bit (QJL — Quantized Johnson-Lindenstrauss):**
+  TurboQuant takes that leftover error $e$, projects it randomly, and saves **just 1 sign bit (`+1` or `-1`) per dimension**:
+  $$\text{Total TurboQuant Storage} = \underbrace{\text{2 bits (PolarQuant main value)}}_{\text{Captures 95\% of the vector}} + \underbrace{\text{1 bit (QJL error sign)}}_{\text{Cancels out rounding bias}} = \mathbf{3\text{ Bits Total!}}$$
+* **The Result:** That single extra QJL bit acts as a **mathematical noise-canceler**, making the estimated dot product between a high-precision query $q$ and the 3-bit compressed vector **100% unbiased**!
+
+---
+
+### 2.4 Where TurboQuant Fits in Your Architecture (Vector DBs & vLLM)
+
+Because you are studying both **Phase 1 (Vector Search)** and **Phase 3 (vLLM & LLM Serving)**, TurboQuant gives you a massive advantage in both topics:
+
+| Comparison Metric | Product Quantization (PQ - Old) | Binary Quantization (BQ - 1 Bit) | Google TurboQuant (3-Bit / 4-Bit) |
+| :--- | :--- | :--- | :--- |
+| **Size of 768d Vector** | $96\text{ Bytes}$ (1 byte per 8 dims) | $96\text{ Bytes}$ (1 bit per dim) | **$288\text{ Bytes}$** (at 3 bits/dim) |
+| **Requires k-Means Training?** | **Yes** (Slow offline training) | No (Needs mean-centering) | **No (100% Training-Free / Online)** |
+| **Breaks on Concept Drift?** | **Yes** (Codebooks go stale) | No | **No** (Random rotation works on any domain) |
+| **Needs Disk Rescoring?** | Usually Yes | **Yes** (Needs $3\times$ SSD rescore) | **No!** (3-bit PolarQuant + 1-bit QJL is accurate directly in RAM) |
+| **Works for Live LLM KV Cache?** | **No** (Cannot cluster live tokens) | Poor accuracy on attention logits | **Yes!** (Built into **vLLM** for $6\times$ KV cache compression with 0 accuracy loss) |
+
+---
+
+### File 2: `day3_addendum_quick_revision_notes.md` (5-Minute Reference Sheet)
+
+# Day 3 Addendum Quick Reference: SIMD & Google TurboQuant
+
+*Attach to your Day 3 Quick Reference Notes for rapid review.*
+
+---
+
+## 1. SIMD (Single Instruction, Multiple Data) in One Glance
+
+* **Mental Model:** *The 16-Stamp Wooden Bar.* Instead of multiplying vector numbers one by one in a `for` loop, the CPU loads 512 bits (64 Bytes) of data into a wide **AVX-512 Vector Register** and multiplies/adds **all lanes simultaneously in 1 clock cycle**.
+* **How Quantization Multiplies SIMD Speed (512-Bit Register Math):**
+  * **FP32 (32-bit floats):** Processes $\frac{512}{32} = \mathbf{16\text{ dims/cycle}}$ via Fused Multiply-Add (`FMA`).
+  * **INT8 (8-bit ints):** Processes $\frac{512}{8} = \mathbf{64\text{ dims/cycle}}$ via `AVX-512 VNNI`.
+  * **Binary (1-bit signs):** Processes $\frac{512}{1} = \mathbf{512\text{ dims/cycle}}$ via bitwise `XOR + POPCOUNT`.
+* **Why Adaptive Query Planners Use SIMD:** Because AVX-512 can scan 1,000 vectors in **<1 millisecond**, whenever an RBAC metadata filter matches fewer than ~2,000 vectors, skipping the HNSW graph and running a **SIMD Brute-Force Flat Scan** is both faster and gives 100% exact recall.
+
+---
+
+## 2. Google TurboQuant in One Glance
+
+* **What It Is:** A **training-free, online vector quantization algorithm** (Google Research, 2026) that compresses vectors down to **3 or 4 bits per dimension** ($6\times\text{ to }10\times$ smaller than FP16/FP32) with near-zero accuracy loss and **no k-means codebooks**.
+* **The 3-Stage Pipeline (2 Bits PolarQuant + 1 Bit QJL = 3 Bits Total):**
+  1. **Random Rotation ($z = R \cdot x$):** Multiplies the vector by a fast orthogonal rotation matrix. This preserves exact dot-product distances while **smoothing out spiky outlier dimensions** into a uniform, predictable distribution—eliminating the need to train data-specific codebooks.
+  2. **PolarQuant (2–3 Bits):** Converts Cartesian $(x, y)$ coordinates into **Polar coordinates (1 radius + bounded angles)**. Because angles always sit within $[0, 2\pi]$, it eliminates the memory overhead of storing per-block min/max scaling constants.
+  3. **QJL (Quantized Johnson-Lindenstrauss — 1 Bit):** Takes the tiny rounding error ($e = x - \hat{x}$) left over from PolarQuant and encodes it using **1 sign bit (`+1/-1`) per dimension**. This acts as a mathematical error-checker that makes inner-product similarity and LLM attention scores **provably unbiased**.
+
+---
+
+## 3. Important Questions (SIMD & TurboQuant)
+
+**Q1: Why does quantizing vectors from FP32 to INT8 or Binary speed up query latency even when all vectors already fit in RAM?**  
+*Two hardware reasons: First, vector similarity search is **memory-bandwidth bound**—fetching 4x to 32x fewer bytes from RAM into the CPU L1/L2 cache eliminates memory bus stalls. Second, **SIMD register packing**—a 512-bit AVX-512 CPU register can only hold 16 FP32 numbers at once, but holds 64 INT8 numbers (`VNNI`) or 512 Binary bits (`POPCOUNT`), executing up to 32x fewer CPU instructions per vector comparison.*
+
+**Q2: How does Google's TurboQuant beat traditional Product Quantization (PQ) in streaming production systems?**  
+*Product Quantization is data-dependent: it requires expensive offline k-means clustering to learn codebooks and suffers from **centroid staleness (concept drift)** when new document domains arrive. TurboQuant is **data-oblivious and online**: by applying a random orthogonal rotation ($z = Rx$), it forces any arbitrary vector's coordinates into a known mathematical distribution. It then uses **PolarQuant** (2 bits) for the main signal and **1-bit QJL** to cancel residual inner-product bias—achieving better recall than PQ at 3-bit precision with zero index training time and zero concept drift.*
+
+**Q3: Where can TurboQuant be used outside of Vector Databases?**  
+*In **LLM Inference Serving (vLLM)** to compress the **KV Cache**. During long-context generation (e.g., 32k–128k tokens), the KV cache consumes tens of gigabytes of GPU VRAM. Because new Key and Value vectors are generated dynamically on every token step, offline k-means (PQ) is impossible. TurboQuant compresses KV cache vectors online in real time by **6x (at 3-bit precision)** with zero calibration data and zero degradation on Needle-in-a-Haystack or LongBench benchmarks.*
+
+````markdown
